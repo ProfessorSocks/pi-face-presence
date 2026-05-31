@@ -1,7 +1,6 @@
-"""
-Pi Face Presence — presence_agent.py
+"""Pi Face Presence — presence_agent.py
 
-Future-proof face presence + identity agent for Raspberry Pi.
+Future‑proof face presence + identity agent for Raspberry Pi.
 
 Today:
 - Loads known identities from ./faces/<Name>/*.jpg
@@ -20,149 +19,268 @@ Folder layout expected (case-sensitive on Linux):
 Usage:
   source venv/bin/activate
   python src/presence_agent.py
+
+Optional preview window (requires GUI):
+  python src/presence_agent.py --show-preview
 """
 
-import time
-import os
+from __future__ import annotations
+
+import argparse
 import glob
-import json
+import os
+import sys
+import time
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
 import cv2
 import face_recognition
-import paho.mqtt.client as mqtt
-from picamera2 import Picamera2
-from datetime import datetime
 
-AGENT_ID = "serpi5v2"
-ROOM = "entry_way"
-MQTT_HOST = "localhost"
-MQTT_PORT = 1883
-MQTT_BASE = "pp/v1"
+cap = cv2.VideoCapture("/dev/video0", cv2.CAP_V4L2)
 
+cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"YUYV"))
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-def iso_now():
-    return datetime.now().astimezone().isoformat(timespec="seconds")
+if not cap.isOpened():
+    print("[ERROR] Could not open USB camera at /dev/video0")
+else:
+    print("[RUN] USB camera online at /dev/video0.")
 
 
-def mqtt_topic(*parts):
-    return "/".join([MQTT_BASE, *parts])
+@dataclass
+class KnownIdentity:
+    name: str
+    encodings: List
 
 
-def publish_json(client, topic, payload, retain=False):
-    client.publish(topic, json.dumps(payload), qos=1, retain=retain)
+def find_identity_dirs(faces_dir: str) -> List[str]:
+    """Return immediate subdirectories under faces_dir."""
+    if not os.path.isdir(faces_dir):
+        raise FileNotFoundError(
+            f"Faces directory not found: {faces_dir}\n"
+            "Create it like: mkdir -p faces/Camille faces/Shelby"
+        )
+
+    dirs = []
+    for entry in sorted(os.listdir(faces_dir)):
+        path = os.path.join(faces_dir, entry)
+        if os.path.isdir(path) and not entry.startswith("."):
+            dirs.append(path)
+    return dirs
 
 
-def load_known_faces(base_dir="faces"):
-    known_encodings = []
-    known_names = []
+def load_known_identities(
+    faces_dir: str,
+    model: str = "hog",
+) -> List[KnownIdentity]:
+    """Load and encode all faces found under faces_dir/<Name>/*.jpg|png.
 
-    for person_name in os.listdir(base_dir):
-        person_dir = os.path.join(base_dir, person_name)
-        if not os.path.isdir(person_dir):
+    model: "hog" (fast, CPU) or "cnn" (more accurate, slower; needs heavy compute)
+    """
+    identities: List[KnownIdentity] = []
+
+    for person_dir in find_identity_dirs(faces_dir):
+        name = os.path.basename(person_dir)
+        image_paths = []
+        for ext in ("*.jpg", "*.jpeg", "*.png", "*.webp"):
+            image_paths.extend(glob.glob(os.path.join(person_dir, ext)))
+
+        if not image_paths:
+            print(f"[WARN] No images found for '{name}' in {person_dir}")
             continue
 
-        image_files = []
-        for ext in ("*.jpg", "*.jpeg", "*.png"):
-            image_files.extend(glob.glob(os.path.join(person_dir, ext)))
+        encs = []
+        for p in sorted(image_paths):
+            try:
+                img = face_recognition.load_image_file(p)
+                # If the training image has multiple faces, we take the first.
+                locs = face_recognition.face_locations(img, model=model)
+                if not locs:
+                    print(f"[WARN] No face found in training image: {p}")
+                    continue
+                enc = face_recognition.face_encodings(img, known_face_locations=locs)
+                if not enc:
+                    print(f"[WARN] Could not encode face in training image: {p}")
+                    continue
+                encs.append(enc[0])
+            except Exception as e:
+                print(f"[WARN] Failed to process {p}: {e}")
 
-        print(f"[LOAD] {person_name}: {len(image_files)} images")
+        if not encs:
+            print(f"[WARN] No usable face encodings for '{name}'.")
+            continue
 
-        for img_path in image_files:
-            image = face_recognition.load_image_file(img_path)
-            locations = face_recognition.face_locations(image)
-            if not locations:
-                continue
+        identities.append(KnownIdentity(name=name, encodings=encs))
+        print(f"[OK] Loaded {len(encs)} face encodings for '{name}'")
 
-            encodings = face_recognition.face_encodings(image, locations)
-            if encodings:
-                known_encodings.append(encodings[0])
-                known_names.append(person_name)
+    if not identities:
+        raise RuntimeError(
+            "No identities loaded. Add training photos under faces/<Name>/ and retry.\n"
+            "Example: faces/Camille/1.jpg, faces/Shelby/1.jpg"
+        )
 
-    return known_encodings, known_names
+    return identities
 
 
-def main():
-    print("[BOOT] Starting Pi Face Presence Agent (MQTT enabled)")
+def flatten_encodings(identities: List[KnownIdentity]) -> Tuple[List, List[str]]:
+    """Flatten list of identities into (encodings, labels) arrays."""
+    all_encodings = []
+    all_labels = []
+    for ident in identities:
+        for e in ident.encodings:
+            all_encodings.append(e)
+            all_labels.append(ident.name)
+    return all_encodings, all_labels
 
-    known_encodings, known_names = load_known_faces("faces")
+
+def choose_best_match(
+    face_encoding,
+    known_encodings: List,
+    known_labels: List[str],
+    threshold: float,
+) -> Tuple[str, float]:
+    """Return (label, distance). Label is 'Unknown' if no match under threshold."""
     if not known_encodings:
-        print("[ERROR] No training faces found.")
-        return
+        return "Unknown", 1.0
 
-    client = mqtt.Client()
-    client.connect(MQTT_HOST, MQTT_PORT, 60)
-    client.loop_start()
+    distances = face_recognition.face_distance(known_encodings, face_encoding)
+    best_i = int(distances.argmin())
+    best_dist = float(distances[best_i])
 
-    # Publish agent online
-    publish_json(client, mqtt_topic("system", "agent", "status"), {
-        "agent_id": AGENT_ID,
-        "state": "online",
-        "timestamp": iso_now()
-    }, retain=True)
+    if best_dist <= threshold:
+        return known_labels[best_i], best_dist
+    return "Unknown", best_dist
 
-    picam = Picamera2()
-    config = picam.create_preview_configuration(main={"size": (640, 480)})
-    picam.configure(config)
-    picam.start()
-    time.sleep(1.5)
 
-    print("[RUN] Camera online. Presence detection active.")
+def init_camera(width, height):
+    cap = cv2.VideoCapture(0)
 
-    present = set()
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"YUYV"))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+
+    if not cap.isOpened():
+        print("[ERROR] Could not open USB camera")
+        return None
+
+    print("[RUN] USB camera online. Presence detection active.")
+    return cap
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Pi Face Presence — presence agent")
+    parser.add_argument(
+        "--faces-dir",
+        default="faces",
+        help="Directory containing faces/<Name>/*.jpg training images (default: faces)",
+    )
+    parser.add_argument(
+        "--width", type=int, default=640, help="Camera capture width (default: 640)"
+    )
+    parser.add_argument(
+        "--height", type=int, default=480, help="Camera capture height (default: 480)"
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.50,
+        help="Face match threshold (lower = stricter). Typical: 0.45–0.60 (default: 0.50)",
+    )
+    parser.add_argument(
+        "--model",
+        choices=["hog", "cnn"],
+        default="hog",
+        help="Face location model: hog (fast) or cnn (slower, more accurate) (default: hog)",
+    )
+    parser.add_argument(
+        "--interval",
+        type=float,
+        default=0.35,
+        help="Seconds between recognition loops (default: 0.35)",
+    )
+    parser.add_argument(
+        "--show-preview",
+        action="store_true",
+        help="Show a live preview window (may not work over some remote sessions)",
+    )
+
+    args = parser.parse_args()
+
+    identities = load_known_identities(args.faces_dir, model=args.model)
+    known_encodings, known_labels = flatten_encodings(identities)
+
+    picam = init_camera(args.width, args.height)
+
+    last_printed: Optional[str] = None
+    last_print_time = 0.0
+
+    print("\n[RUN] Starting recognition. Press Ctrl+C to stop.")
 
     try:
         while True:
-            frame = picam.capture_array()
+            ret, frame = cap.read()
+            if not ret:
+                print("[WARN] Failed to read frame")
+                time.sleep(0.5)
+                continue
 
-            # Convert XBGR8888 (4 channels) → RGB (3 channels)
-            rgb = frame[:, :, :3]           # drop alpha
-            rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
-
-            face_locations = face_recognition.face_locations(rgb)
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # Detect faces and compute encodings
+            face_locations = face_recognition.face_locations(rgb, model=args.model)
             face_encodings = face_recognition.face_encodings(rgb, face_locations)
 
-            seen = set()
+            labels_this_frame: List[str] = []
+            for enc, (top, right, bottom, left) in zip(face_encodings, face_locations):
+                label, dist = choose_best_match(enc, known_encodings, known_labels, args.threshold)
+                labels_this_frame.append(label)
 
-            for enc in face_encodings:
-                distances = face_recognition.face_distance(known_encodings, enc)
-                best = distances.argmin()
-                if distances[best] < 0.5:
-                    seen.add(known_names[best])
+                if args.show_preview:
+                    cv2.rectangle(bgr, (left, top), (right, bottom), (0, 255, 0), 2)
+                    cv2.putText(
+                        bgr,
+                        f"{label}",
+                        (left, max(0, top - 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (0, 255, 0),
+                        2,
+                    )
 
-            # Arrivals
-            for person in seen - present:
-                print(f"[EVENT] {person} arrived")
-                publish_json(client, mqtt_topic("people", person, "event"), {
-                    "person": person,
-                    "event": "arrived",
-                    "room": ROOM,
-                    "confidence": 0.8,
-                    "timestamp": iso_now(),
-                    "source": AGENT_ID
-                })
+            # Print a simple presence line when the identity set changes
+            # (debounced so it doesn't spam the terminal)
+            now = time.time()
+            if labels_this_frame:
+                # If multiple faces, print comma-separated unique labels
+                current = ", ".join(sorted(set(labels_this_frame)))
+            else:
+                current = "No face"
 
-            # Departures
-            for person in present - seen:
-                print(f"[EVENT] {person} departed")
-                publish_json(client, mqtt_topic("people", person, "event"), {
-                    "person": person,
-                    "event": "departed",
-                    "room": ROOM,
-                    "confidence": 0.0,
-                    "timestamp": iso_now(),
-                    "source": AGENT_ID
-                })
+            if current != last_printed and (now - last_print_time) > 0.6:
+                print(f"[PRESENCE] {current}")
+                last_printed = current
+                last_print_time = now
 
-            present = seen
+            if args.show_preview:
+                cv2.imshow("Pi Face Presence", bgr)
+                if cv2.waitKey(1) & 0xFF == 27:
+                    break
 
-            time.sleep(0.5)
+            time.sleep(args.interval)
 
     except KeyboardInterrupt:
-        print("\n[STOP] Shutting down.")
+        print("\n[STOP] Keyboard interrupt — shutting down.")
     finally:
-        picam.stop()
-        client.loop_stop()
-        client.disconnect()
+        try:
+            cap.release()
+        except Exception:
+            pass
+        if args.show_preview:
+            cv2.destroyAllWindows()
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
