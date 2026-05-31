@@ -1,0 +1,8 @@
+# Pi Face Presence (Python deps)
+# Note: On Raspberry Pi OS, prefer apt for some packages (opencv, picamera2).
+# This requirements file covers the Python-level deps you pip-install in your venv.
+
+paho-mqtt
+face-recognition
+face-recognition-models
+numpy
